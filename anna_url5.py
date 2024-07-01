@@ -24,24 +24,43 @@ if not sec_key:
 # Set the API token as an environment variable
 os.environ["HUGGINGFACEHUB_API_TOKEN"] = sec_key
 
-# Define the repository ID and initialize the HuggingFaceEndpoint with the desired model
+# Define the repository ID and initialize the HuggingFaceEndpoint with Mistral-7B
 repo_id = "meta-llama/Meta-Llama-3-8B-Instruct"
 llm = HuggingFaceEndpoint(repo_id=repo_id, max_length=256, temperature=0.5, token=sec_key, timeout=30)
 
 def fetch_website_content(url):
     """Fetch content from the given URL."""
-    response = requests.get(url)
-    if response.status_code == 200:
+    try:
+        response = requests.get(url)
+        response.raise_for_status()  # Raise an exception for HTTP errors
         soup = BeautifulSoup(response.text, 'html.parser')
         text = ' '.join(p.get_text() for p in soup.find_all('p'))
         return text
-    else:
-        raise ValueError(f"Failed to retrieve content from {url}, status code: {response.status_code}")
+    except requests.RequestException as e:
+        st.warning(f"Failed to retrieve content from {url}: {e}")
+        return None
 
 def clean_text(text):
     """Clean and pre-process the text."""
+    # Example cleaning steps: removing extra spaces, newline characters, etc.
     text = text.replace('\n', ' ').replace('\r', ' ').strip()
     return ' '.join(text.split())
+
+# Few-shot examples
+few_shot_examples = [
+    {
+        "question": "What is the capital of France?",
+        "answer": "The capital of France is Paris."
+    },
+    {
+        "question": "Who wrote 'To Kill a Mockingbird'?",
+        "answer": "'To Kill a Mockingbird' was written by Harper Lee."
+    },
+    {
+        "question": "What is the largest planet in our solar system?",
+        "answer": "The largest planet in our solar system is Jupiter."
+    }
+]
 
 # Streamlit UI
 st.header("Anna")
@@ -65,51 +84,60 @@ if urls:
     for url in urls:
         if url.strip():
             content = fetch_website_content(url.strip())
-            content = clean_text(content)
-            chunks = text_splitter.split_text(content)
-            for chunk in chunks:
-                url_chunks_map[chunk_id] = {'url': url.strip(), 'content': chunk}
-                chunk_id += 1
+            if content:
+                content = clean_text(content)
+                chunks = text_splitter.split_text(content)
+                for chunk in chunks:
+                    url_chunks_map[chunk_id] = {'url': url.strip(), 'content': chunk}
+                    chunk_id += 1
 
-    # Generating embeddings
-    embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+    if url_chunks_map:
+        # Generating embeddings
+        embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
 
-    # Creating vector store - FAISS
-    vector_store = FAISS.from_texts([chunk['content'] for chunk in url_chunks_map.values()], embeddings)
+        # Creating vector store - FAISS
+        vector_store = FAISS.from_texts([chunk['content'] for chunk in url_chunks_map.values()], embeddings)
 
-    # Get user question
-    user_question = st.text_input("Type your question here")
+        # Get user question
+        user_question = st.text_input("Type your question here")
 
-    # Do similarity search
-    if user_question:
-        match = vector_store.similarity_search(user_question)
-        
-        # Find the relevant URL
-        relevant_url = None
-        for doc in match:
-            for chunk_id, chunk in url_chunks_map.items():
-                if doc.page_content == chunk['content']:
-                    relevant_url = chunk['url']
+        # Do similarity search
+        if user_question:
+            match = vector_store.similarity_search(user_question)
+            
+            # Find the relevant URL
+            relevant_url = None
+            for doc in match:
+                for chunk_id, chunk in url_chunks_map.items():
+                    if doc.page_content == chunk['content']:
+                        relevant_url = chunk['url']
+                        break
+                if relevant_url:
                     break
+
+            # Incorporate few-shot examples
+            few_shot_prompt = "\n".join([f"Q: {example['question']}\nA: {example['answer']}" for example in few_shot_examples])
+            few_shot_prompt += f"\nQ: {user_question}\nA:"
+
+            # Use the retrieved documents and the user question to generate a response
+            chain = load_qa_chain(llm, chain_type="stuff")
+            response = chain.run(input_documents=match, question=few_shot_prompt)
+            
+            # Post-process the response to remove unnecessary parts
+            def clean_response(response):
+                response_lines = response.split('\n')
+                useful_lines = [line for line in response_lines if 'unhelpful' not in line.lower() and 'i don\'t know' not in line.lower()]
+                return ' '.join(useful_lines).strip()
+
+            cleaned_response = clean_response(response)
+
+            # Display the response
+            st.write(cleaned_response)
+            
+            # Display the relevant source URL at the bottom
             if relevant_url:
-                break
-
-        # Load the QA chain with Map-Reduce
-        chain = load_qa_chain(llm, chain_type="map_reduce")
-
-        # Output results
-        response = chain.run(input_documents=match, question=user_question)
-        
-        # Post-process the response
-        response = response.replace('\n', ' ').strip()
-
-        # Display the response
-        st.write(response)
-        
-        # Display the relevant source URL at the bottom
-        if relevant_url:
-            st.write("\n\n**Source of the content:**")
-            st.write(f"- {relevant_url}")
+                st.write("\n\n**Source of the content:**")
+                st.write(f"- {relevant_url}")
 
 def log_resource_usage(interval=10):
     """Log the resource usage at the specified interval (in seconds)."""
